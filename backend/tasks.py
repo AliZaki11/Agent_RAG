@@ -1,45 +1,47 @@
-"""
-CrewAI Tasks — Router · Retriever · Critic
-"""
 from crewai import Task
-
 
 def router_task(agent) -> Task:
     return Task(
         description=(
-            "Analyse the following question and decide the best source:\n\n"
+            "Classify the following question into exactly one route.\n\n"
             "Question: {question}\n\n"
+            "Conversation memory:\n{memory}\n\n"
             "Rules:\n"
-            "- Return 'rag'    if the question is about documents, files, or domain knowledge.\n"
-            "- Return 'web'    if the question needs current/live information.\n"
-            "- Return 'memory' if the question references something from this conversation.\n\n"
-            "Respond with ONLY valid JSON, no extra text:\n"
-            '{"route": "rag" | "web" | "memory"}'
+            "- 'rag'    → question is about uploaded documents, internal knowledge base, domain content.\n"
+            "- 'web'    → question needs current events, live data, news, or anything time-sensitive.\n"
+            "- 'memory' → question explicitly references the current conversation "
+            "             (says 'you said', 'earlier', 'before', 'previously').\n\n"
+            "Think step by step, then respond with ONLY valid JSON (no markdown, no extra text):\n"
+            '{{"route": "rag" | "web" | "memory", "reason": "<one sentence>"}}'
         ),
-        expected_output='JSON object with key "route".',
+        expected_output='JSON with keys "route" and "reason".',
         agent=agent,
     )
-
 
 def retriever_task(agent, router_task_ref) -> Task:
     return Task(
         description=(
-            "Using the route selected by the Router, retrieve information "
-            "and answer the question.\n\n"
+            "Retrieve information and answer the question based on the route decision.\n\n"
             "Question: {question}\n\n"
+            "Conversation memory (use if route=memory):\n{memory}\n\n"
             "Instructions:\n"
-            "- If route is 'rag':    use hybrid_rag_retrieve tool.\n"
-            "- If route is 'web':    use web_search tool.\n"
-            "- If route is 'memory': use the conversation context provided.\n"
-            "- Always include the source context in your output.\n\n"
-            "Respond with ONLY valid JSON:\n"
-            '{"context": "...", "answer": "..."}'
+            "- route=rag    → call hybrid_rag_retrieve with the question.\n"
+            "- route=web    → call web_search with a focused search query.\n"
+            "- route=memory → answer directly from the conversation memory above.\n"
+            "- Always capture the raw retrieved text as context.\n"
+            "- LANGUAGE: Detect the language of the Question. "
+            "  If Arabic → answer in Arabic. If English → answer in English.\n"
+            "- FORMATTING (mandatory):\n"
+            "  * Do NOT use markdown bold (**text**) or headers (# ## ###).\n"
+            "  * Use plain numbered lists (1. 2. 3.) or dashes (- ) for lists.\n"
+            "  * Separate paragraphs with a blank line.\n\n"
+            "Respond with ONLY valid JSON (no markdown, no extra text):\n"
+            '{{"context": "<raw retrieved text>", "answer": "<your plain-text answer>"}}'
         ),
-        expected_output='JSON object with keys "context" and "answer".',
+        expected_output='JSON with keys "context" and "answer".',
         context=[router_task_ref],
         agent=agent,
     )
-
 
 def critic_task(agent, retriever_task_ref) -> Task:
     return Task(
@@ -48,11 +50,16 @@ def critic_task(agent, retriever_task_ref) -> Task:
             "Question: {question}\n\n"
             "Instructions:\n"
             "- Check every factual claim against the provided context.\n"
-            "- If all claims are supported → set grounded: true.\n"
-            "- If any claim is unsupported or hallucinated → set grounded: false.\n"
-            "- Improve or correct the final_answer if needed.\n\n"
-            "Respond with ONLY valid JSON:\n"
-            '{"grounded": true|false, "final_answer": "...", "confidence": 0.0-1.0}'
+            "- If all claims are supported → grounded: true.\n"
+            "- If any claim is unsupported → grounded: false.\n"
+            "- Improve or correct the final_answer if needed.\n"
+            "- LANGUAGE: Respond in the SAME language as the question.\n"
+            "- FORMATTING for final_answer (mandatory):\n"
+            "  * Do NOT use markdown bold (**text**) or headers (# ## ###).\n"
+            "  * Use plain numbered lists or dashes for lists.\n"
+            "  * Separate paragraphs with a blank line.\n\n"
+            "Respond with ONLY valid JSON (no markdown, no extra text):\n"
+            '{{"grounded": true, "final_answer": "<plain-text answer>", "confidence": 0.0}}'
         ),
         expected_output='JSON with keys "grounded", "final_answer", "confidence".',
         context=[retriever_task_ref],

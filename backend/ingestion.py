@@ -1,104 +1,108 @@
 """
-Ingestion Pipeline — Chunk → Embed → Upsert to Pinecone.
+Ingestion Pipeline — supports .txt / .md / .pdf
+Auto-creates Pinecone index if it doesn't exist.
 """
 from __future__ import annotations
-
-import uuid
-import logging
+import io, uuid, logging
 from pathlib import Path
 from typing import Union
 
-from pinecone import Pinecone
-
-from backend.config import PINECONE_API_KEY, PINECONE_INDEX
-from backend.utils  import embed
+from pinecone import Pinecone, ServerlessSpec
+from backend.config import PINECONE_API_KEY, PINECONE_INDEX, EMBEDDING_DIM
+from backend.utils import embed
 from backend.tools.rag_tool import build_bm25
 
-logger      = logging.getLogger(__name__)
-BATCH_SIZE  = 100
-_all_ingested_texts: list[str] = []  # cumulative for BM25   # Pinecone upsert limit
+logger     = logging.getLogger(__name__)
+BATCH_SIZE = 100
+_all_ingested_texts: list[str] = []
 
+_pc_inst   = None
+_idx_inst  = None
 
-_pc_inst    = None
-_index_inst = None
+def _ensure_index(pc: Pinecone, name: str) -> None:
+    existing = [idx.name for idx in pc.list_indexes()]
+    if name not in existing:
+        logger.info(f"Creating Pinecone index '{name}'…")
+        pc.create_index(
+            name=name, dimension=EMBEDDING_DIM, metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
 
 def _get_index():
-    global _pc_inst, _index_inst
-    if _index_inst is None:
-        _pc_inst    = Pinecone(api_key=PINECONE_API_KEY)
-        _index_inst = _pc_inst.Index(PINECONE_INDEX)
-    return _index_inst
+    global _pc_inst, _idx_inst
+    if _idx_inst is None:
+        _pc_inst = Pinecone(api_key=PINECONE_API_KEY)
+        _ensure_index(_pc_inst, PINECONE_INDEX)
+        _idx_inst = _pc_inst.Index(PINECONE_INDEX)
+    return _idx_inst
 
 
-# ── Text chunking ────────────────────────────────────────────────
+# ── Text extraction ──────────────────────────────────────────────
+
+def extract_text_from_bytes(filename: str, content: bytes) -> str:
+    """Extract plain text from file bytes. Supports txt, md, pdf."""
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            pages  = [p.extract_text() or "" for p in reader.pages]
+            text   = "\n\n".join(p.strip() for p in pages if p.strip())
+            if text.strip():
+                return text
+            logger.warning("PDF text extraction returned empty — falling back to raw decode")
+        except Exception as exc:
+            logger.warning(f"PDF extraction failed ({exc}), falling back to raw decode")
+    return content.decode("utf-8", errors="replace")
+
+
+def extract_text_from_path(path: Union[str, Path]) -> str:
+    path = Path(path)
+    return extract_text_from_bytes(path.name, path.read_bytes())
+
+
+# ── Chunking ─────────────────────────────────────────────────────
 
 def chunk_text(text: str, size: int = 512, overlap: int = 64) -> list[str]:
-    """Sliding-window character chunker with overlap."""
-    words  = text.split()
-    chunks = []
-    step   = size - overlap
-
-    for i in range(0, len(words), step):
-        chunk = " ".join(words[i : i + size])
-        if chunk:
-            chunks.append(chunk)
-
-    return chunks
-
-
-def chunk_file(path: Union[str, Path], size: int = 512, overlap: int = 64) -> list[str]:
-    """Read a text file and chunk it."""
-    text = Path(path).read_text(encoding="utf-8")
-    return chunk_text(text, size=size, overlap=overlap)
+    """Sliding-window word chunker with overlap."""
+    words = text.split()
+    step  = max(1, size - overlap)
+    return [
+        " ".join(words[i: i + size])
+        for i in range(0, len(words), step)
+        if " ".join(words[i: i + size]).strip()
+    ]
 
 
 # ── Upsert ───────────────────────────────────────────────────────
 
 def ingest(chunks: list[str], namespace: str = "") -> int:
-    """
-    Embed and upsert chunks into Pinecone.
-
-    Args:
-        chunks:    List of text strings to ingest.
-        namespace: Pinecone namespace (optional grouping).
-
-    Returns:
-        Number of vectors upserted.
-    """
     if not chunks:
-        logger.warning("ingest() called with empty chunks list.")
         return 0
-
-    index    = _get_index()
-    total    = 0
-    all_texts = []
+    global _all_ingested_texts
+    index = _get_index()
+    total = 0
 
     for start in range(0, len(chunks), BATCH_SIZE):
-        batch      = chunks[start : start + BATCH_SIZE]
+        batch      = chunks[start: start + BATCH_SIZE]
         embeddings = embed(batch)
-
-        vectors = [
-            (str(uuid.uuid4()), emb, {"text": chunk})
-            for emb, chunk in zip(embeddings, batch)
-        ]
-
-        kwargs = {"vectors": vectors}
+        vectors    = [(str(uuid.uuid4()), emb, {"text": chunk})
+                      for emb, chunk in zip(embeddings, batch)]
+        kwargs: dict = {"vectors": vectors}
         if namespace:
             kwargs["namespace"] = namespace
-
         index.upsert(**kwargs)
-        total     += len(vectors)
-        all_texts += batch
+        total += len(vectors)
+        _all_ingested_texts.extend(batch)
         logger.info(f"Upserted batch {start // BATCH_SIZE + 1}: {len(vectors)} vectors")
 
-    # Rebuild BM25 with ALL texts ever ingested (not just this batch)
-    _all_ingested_texts.extend(all_texts)
     build_bm25(_all_ingested_texts)
-    logger.info(f"✅ Ingestion complete: {total} vectors.")
+    logger.info(f"✅ Ingest complete: {total} vectors, BM25 rebuilt.")
     return total
 
 
 def ingest_file(path: Union[str, Path], **kwargs) -> int:
-    chunks = chunk_file(path)
+    text   = extract_text_from_path(path)
+    chunks = chunk_text(text)
     logger.info(f"Ingesting '{path}' → {len(chunks)} chunks")
     return ingest(chunks, **kwargs)

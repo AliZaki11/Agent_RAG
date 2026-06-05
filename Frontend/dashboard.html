@@ -374,8 +374,8 @@ kbd{font-family:var(--mono);font-size:10px;padding:1px 5px;border-radius:4px;bor
 // ── State ──────────────────────────────────────────────
 let qCount=0,groundedCount=0,docCount=0,busy=false;
 let rc={rag:0,web:0,memory:0};
-const API = document.querySelector('meta[name="api-url"]')?.content || 'http://localhost:8000';
-const MODE='demo';
+const API = document.querySelector('meta[name="api-url"]')?.content || '';
+const MODE='api';
 const DEMOS=[
   {a:"Based on the uploaded documents, the system features three collaborative AI agents: a Router that decides the best source, a Retriever that fetches information using Hybrid Search (Dense + BM25) with Cross-Encoder reranking, and a Critic that validates every answer before delivery.",r:"rag",g:true,i:1},
   {a:"According to current web search results, the AI landscape is evolving rapidly — reasoning models, agentic frameworks, and retrieval-augmented generation are among the most adopted techniques in enterprise AI deployments as of this year.",r:"web",g:true,i:2},
@@ -523,7 +523,7 @@ async function ingestRaw(){
       docCount+=data.chunks||chunks.length;
     }catch(e){$('ing-status').textContent=`Upload error: ${e.message}`;return;}
   }else{docCount+=chunks.length;}
-  $('ing-status').textContent=` Saved — ${chunks.length} chunks`;
+  $('ing-status').textContent=`✅ Saved — ${chunks.length} chunks`;
   $('raw-text').value='';updateStats();
 }
 
@@ -546,6 +546,159 @@ function toggleTheme(){
 function openHelp(){$('hm').classList.add('open')}
 function closeHelp(){$('hm').classList.remove('open')}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeHelp()});
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════
+// PATCH — replaces 3 broken functions in the original dashboard
+// Include AFTER the main dashboard script block
+// ═══════════════════════════════════════════════════════════
+
+// ── FIX 1: handleFile2 now POSTs to /ingest/file API ─────────
+// (was reading file locally with FileReader, never sending to server)
+async function handleFile2(f) {
+  const st = $('ing-status');
+  if (!f) return;
+  const safeName = (f.name || 'file').replace(/\W/g, '_');
+  st.textContent = `⏳ Uploading ${f.name}…`;
+  _addUploadItem(f.name, '⏳');
+
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    const res = await fetch(`${API}/ingest/file`, { method: 'POST', body: fd });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+    const chunks = data.chunks || '?';
+    docCount += Number(chunks) || 0;
+    st.textContent = `✅ ${chunks} chunks — "${f.name}"`;
+    const statusEl = document.getElementById('ufs-' + safeName);
+    if (statusEl) statusEl.textContent = `✅ ${chunks} chunks`;
+    updateStats();
+  } catch (e) {
+    st.textContent = `❌ ${e.message}`;
+    const statusEl = document.getElementById('ufs-' + safeName);
+    if (statusEl) { statusEl.textContent = '❌'; statusEl.style.color = 'var(--red)'; }
+  }
+}
+
+function handleDrop2(ev) {
+  ev.preventDefault();
+  ev.currentTarget.classList.remove('drag');
+  handleFile2(ev.dataTransfer.files[0]);
+}
+
+// ── FIX 2: Follow-up buttons reference the ORIGINAL question ──
+// (was sending answer text back, causing infinite loops)
+// This patches addMsg by overriding the action button creation.
+// The fix is in how buttons are built — they now reference
+// lastUserQuestion instead of the answer snippet.
+const _originalAddMsg = typeof addMsg === 'function' ? addMsg : null;
+function addMsg(role, rawText, meta = {}) {
+  $('welcome')?.remove();
+  const chat = $('chat');
+  const isAgent = role === 'agent';
+  const text = isAgent ? formatAnswer(rawText) : rawText;
+  const ts = nowStr();
+  chatHistory.push({ role, text, ts });
+  if (chatHistory.length > 1) {
+    $('btn-dl').style.display = '';
+    $('btn-clear').style.display = '';
+  }
+  const wrap = document.createElement('div');
+  wrap.className = `msg ${role}`;
+  const av = document.createElement('div');
+  av.className = `avatar ${role}`;
+  av.textContent = role === 'user' ? 'U' : '✦';
+  const body = document.createElement('div');
+  body.style.maxWidth = '70%';
+  const bub = document.createElement('div');
+  bub.className = 'bubble';
+  if (isAgent) {
+    bub.innerHTML = renderAnswer(rawText);
+    if (meta.score !== undefined) {
+      const pct = Math.round(meta.score * 100);
+      const cls = pct >= 70 ? '' : pct >= 40 ? 'mid' : 'low';
+      const confEl = document.createElement('div');
+      confEl.className = 'conf-bar-wrap';
+      confEl.innerHTML = `<div class="conf-bar-track"><div class="conf-bar-fill ${cls}" style="width:${pct}%"></div></div><span class="conf-lbl">${pct}%</span>`;
+      bub.appendChild(confEl);
+    }
+    const ft = document.createElement('div');
+    ft.className = 'bubble-footer';
+    if (meta.r) { const tg = document.createElement('span'); tg.className = `tag tag-${meta.r}`; tg.textContent = meta.r.toUpperCase(); ft.appendChild(tg); }
+    if (meta.g !== undefined) { const tg = document.createElement('span'); tg.className = `tag ${meta.g ? 'tag-ok' : 'tag-warn'}`; tg.textContent = meta.g ? t('tag_verified') : t('tag_unverified'); ft.appendChild(tg); }
+    if (meta.i > 1) { const tg = document.createElement('span'); tg.className = 'tag tag-iter'; tg.textContent = `×${meta.i}`; ft.appendChild(tg); }
+    const tg = document.createElement('span'); tg.className = 'tag tag-time'; tg.textContent = ts; ft.appendChild(tg);
+    bub.appendChild(ft);
+
+    // FIX 2: action buttons use the ORIGINAL question, not the answer text
+    const origQ = meta.question || lastUserQuestion || '';
+    const acts = document.createElement('div');
+    acts.className = 'msg-acts';
+    if (origQ) {
+      [
+        [t('act_summary'), `Give a concise 2-sentence summary for: ${origQ}`],
+        [t('act_bullets'),  `Answer as a numbered bullet list: ${origQ}`],
+        [t('act_detail'),   `Give a detailed, expanded answer for: ${origQ}`],
+      ].forEach(([lbl, followUp]) => {
+        const btn = document.createElement('button');
+        btn.className = 'msg-act';
+        btn.textContent = lbl;
+        btn.onclick = () => fillQ(followUp);
+        acts.appendChild(btn);
+      });
+    }
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'msg-act copy-act';
+    copyBtn.textContent = t('act_copy');
+    copyBtn.onclick = () => {
+      navigator.clipboard.writeText(text).then(() => showToast(t('copied')));
+      copyBtn.textContent = '✓';
+      setTimeout(() => copyBtn.textContent = t('act_copy'), 1500);
+    };
+    acts.appendChild(copyBtn);
+    body.appendChild(bub);
+    body.appendChild(acts);
+  } else {
+    bub.textContent = text;
+    const tg = document.createElement('span');
+    tg.style.cssText = 'display:block;font-size:10px;color:rgba(255,255,255,.6);margin-top:4px;text-align:end';
+    tg.textContent = ts;
+    bub.appendChild(tg);
+    body.appendChild(bub);
+  }
+  wrap.appendChild(av);
+  wrap.appendChild(body);
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+// ── FIX 3: ingestRaw also POSTs to API ────────────────────────
+async function ingestRaw() {
+  const txt = $('raw-text').value.trim();
+  if (!txt) return;
+  const chunks = txt.match(/[\s\S]{1,512}/g) || [];
+  $('ing-status').textContent = `⏳ Saving ${chunks.length} chunks…`;
+  try {
+    const res = await fetch(`${API}/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts: chunks }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+    const data = await res.json();
+    docCount += data.chunks || chunks.length;
+    $('ing-status').textContent = ` ${chunks.length} chunks saved`;
+    $('raw-text').value = '';
+    updateStats();
+  } catch (e) {
+    $('ing-status').textContent = ` ${e.message}`;
+  }
+}
+
 </script>
 </body>
 </html>

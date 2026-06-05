@@ -1,7 +1,3 @@
-"""
-Ingestion Pipeline — supports .txt / .md / .pdf
-Auto-creates Pinecone index if it doesn't exist.
-"""
 from __future__ import annotations
 import io, uuid, logging
 from pathlib import Path
@@ -97,7 +93,7 @@ def ingest(chunks: list[str], namespace: str = "") -> int:
         logger.info(f"Upserted batch {start // BATCH_SIZE + 1}: {len(vectors)} vectors")
 
     build_bm25(_all_ingested_texts)
-    logger.info(f"✅ Ingest complete: {total} vectors, BM25 rebuilt.")
+    logger.info(f" Ingest complete: {total} vectors, BM25 rebuilt.")
     return total
 
 

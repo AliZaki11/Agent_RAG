@@ -1,117 +1,37 @@
-"""
-FastAPI Application — Agentic RAG API
-"""
-from __future__ import annotations
+import time, logging, requests
+from functools import lru_cache
+from backend.config import OPENROUTER_API_KEY, EMBEDDING_MODEL
 
-import logging
-from contextlib import asynccontextmanager
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-from backend.orchestrator import run, short_mem
-from backend.ingestion     import ingest, chunk_text
-
-logging.basicConfig(
-    level   = logging.INFO,
-    format  = "%(asctime)s | %(levelname)-8s | %(name)s — %(message)s",
-)
 logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 Agentic RAG API starting…")
-    yield
-    logger.info("🛑 Agentic RAG API shutting down.")
-
-
-app = FastAPI(
-    title       = "Agentic RAG API",
-    description = "Multi-agent Retrieval-Augmented Generation pipeline",
-    version     = "1.0.0",
-    lifespan    = lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins     = ["*"],
-    allow_credentials = True,
-    allow_methods     = ["*"],
-    allow_headers     = ["*"],
-)
-
-
-# ── Schemas ──────────────────────────────────────────────────────
-
-class QueryRequest(BaseModel):
-    question:  str
-    namespace: Optional[str] = ""
-
-class QueryResponse(BaseModel):
-    answer:     str
-    trace:      list[dict]
-    grounded:   bool
-    iterations: int
-
-class IngestRequest(BaseModel):
-    texts:     list[str]
-    namespace: Optional[str] = ""
-
-
-# ── Routes ───────────────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "memory_entries": len(short_mem)}
-
-
-@app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
-    if not req.question.strip():
-        raise HTTPException(status_code=422, detail="question cannot be empty")
-
-    answer, trace = run(req.question)
-    grounded = any(t.get("grounded") for t in trace)
-
-    return QueryResponse(
-        answer     = answer,
-        trace      = trace,
-        grounded   = grounded,
-        iterations = len(trace),
-    )
-
-
-@app.post("/ingest")
-async def ingest_texts(req: IngestRequest, background_tasks: BackgroundTasks):
-    if not req.texts:
-        raise HTTPException(status_code=422, detail="texts list cannot be empty")
-
-    background_tasks.add_task(ingest, req.texts, req.namespace)
-    return {"status": "ingestion queued", "chunks": len(req.texts)}
-
-
-@app.post("/ingest/file")
-async def ingest_file_upload(
-    file: UploadFile = File(...),
-    namespace: str   = "",
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-):
-    content = await file.read()
-    text    = content.decode("utf-8", errors="replace")
-    chunks  = chunk_text(text)
-
-    background_tasks.add_task(ingest, chunks, namespace)
-    return {
-        "status":    "ingestion queued",
-        "filename":  file.filename,
-        "chunks":    len(chunks),
+def embed(texts: list[str], retries: int = 3) -> list[list[float]]:
+    if not texts:
+        return []
+    url = "https://openrouter.ai/api/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://agentic-rag.app",
+        "X-Title":       "Agentic RAG",
     }
+    for attempt in range(retries):
+        try:
+            r = requests.post(url, headers=headers,
+                              json={"model": EMBEDDING_MODEL, "input": texts},
+                              timeout=30)
+            r.raise_for_status()
+            return [x["embedding"] for x in r.json()["data"]]
+        except requests.HTTPError as e:
+            if r.status_code in (401, 403):
+                raise RuntimeError("Invalid OPENROUTER_API_KEY") from e
+            logger.warning(f"Embed HTTP {r.status_code} attempt {attempt+1}")
+        except Exception as e:
+            logger.warning(f"Embed attempt {attempt+1} failed: {e}")
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)
+    raise RuntimeError(f"Embedding failed after {retries} attempts")
 
-
-@app.delete("/memory")
-async def clear_memory():
-    short_mem.clear()
-    return {"status": "short-term memory cleared"}
+@lru_cache(maxsize=2000)
+def cached_embed(text: str) -> tuple:
+    """Single-text embed with LRU cache. Returns tuple (hashable for lru_cache)."""
+    return tuple(embed([text])[0])

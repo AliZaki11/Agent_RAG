@@ -1,47 +1,41 @@
-"""
-Vector Memory — Long-term semantic memory via Pinecone.
-"""
-import uuid
-import logging
+import uuid, logging
 from typing import Optional
-
-from pinecone import Pinecone
-from backend.config import PINECONE_API_KEY, MEMORY_INDEX
+from pinecone import Pinecone, ServerlessSpec
+from backend.config import PINECONE_API_KEY, MEMORY_INDEX, EMBEDDING_DIM
 from backend.utils import embed
 
-logger = logging.getLogger(__name__)
+logger     = logging.getLogger(__name__)
+_pc_inst   = None
+_idx_inst  = None
 
-_pc    = None
-_index = None
-
+def _ensure_index(pc: Pinecone, name: str) -> None:
+    existing = [idx.name for idx in pc.list_indexes()]
+    if name not in existing:
+        logger.info(f"Creating memory index '{name}'…")
+        pc.create_index(
+            name=name, dimension=EMBEDDING_DIM, metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
 
 def _get_index():
-    global _pc, _index
-    if _index is None:
-        _pc    = Pinecone(api_key=PINECONE_API_KEY)
-        _index = _pc.Index(MEMORY_INDEX)
-    return _index
-
+    global _pc_inst, _idx_inst
+    if _idx_inst is None:
+        _pc_inst = Pinecone(api_key=PINECONE_API_KEY)
+        _ensure_index(_pc_inst, MEMORY_INDEX)
+        _idx_inst = _pc_inst.Index(MEMORY_INDEX)
+    return _idx_inst
 
 def store_memory(text: str, meta: Optional[dict] = None) -> str:
-    """Store a piece of text in long-term memory. Returns the generated ID."""
     mem_id = str(uuid.uuid4())
     emb    = embed([text])[0]
-    meta   = meta or {}
-    meta["text"] = text
+    meta   = {**(meta or {}), "text": text}
     _get_index().upsert([(mem_id, emb, meta)])
-    logger.debug(f"Memory stored: {mem_id}")
     return mem_id
 
-
 def retrieve_memory(query: str, top_k: int = 3) -> list[str]:
-    """Retrieve the top-k most semantically similar memories."""
     q_emb = embed([query])[0]
-    res   = _get_index().query(
-        vector=q_emb, top_k=top_k, include_metadata=True
-    )
+    res   = _get_index().query(vector=q_emb, top_k=top_k, include_metadata=True)
     return [m["metadata"]["text"] for m in res["matches"]]
-
 
 def delete_memory(mem_id: str) -> None:
     _get_index().delete(ids=[mem_id])
